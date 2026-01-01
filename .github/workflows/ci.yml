@@ -1,0 +1,124 @@
+name: ci
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Exact head, no stored credential
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          set +e
+          git config --local --name-only --get-regexp '^(http\..*extraheader|credential\.|url\.|include\.|includeif\.|extensions\.worktreeconfig)'
+          rc=$?
+          set -e
+          test "$rc" = 1
+          urls="$(git config --local --get-regexp '^remote\..*\.(push)?url$' || true)"
+          case "$urls" in
+            *@*) echo "a remote URL carries a credential"; exit 1 ;;
+          esac
+          echo "head=$HEAD_SHA"
+      - shell: bash
+        run: python3 -I -m unittest discover -s toy -v
+  token-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: N11 the job token cannot write
+        shell: bash
+        env:
+          TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, sys, urllib.error, urllib.request
+
+          API, REPO, PR = os.environ["GITHUB_API_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["PR_NUMBER"]
+          REFUSED = "Resource not accessible by integration"
+          ZERO = "0" * 40
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+
+
+          OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+
+          def call(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              request = urllib.request.Request(API + path, data=data, method=method, headers={
+                  "Authorization": "Bearer " + os.environ["TOKEN"], "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "gdf-s3-n11"})
+              try:
+                  with OPENER.open(request, timeout=30) as response:
+                      status, headers, raw = response.status, response.headers, response.read(65536)
+              except urllib.error.HTTPError as error:
+                  status, headers, raw = error.code, error.headers, error.read(65536)
+              try:
+                  message = json.loads(raw).get("message", "")
+              except (ValueError, AttributeError):
+                  message = ""
+              message = message if isinstance(message, str) else ""
+              accepted = headers.get("x-accepted-github-permissions")
+              limited = (status == 429 or headers.get("x-ratelimit-remaining") == "0"
+                         or "retry-after" in headers or "rate limit" in message.lower())
+              print(f"n11 {method} {path} status={status} message={message!r} accepted_permissions={accepted!r}")
+              return status, message, limited, accepted
+
+
+          def names(accepted, permission):
+              """When GitHub says which permission a refused request needed, it must be the one withheld."""
+              return accepted is None or permission in {p.strip() for p in re.split(r"[;,]", accepted)}
+
+
+          if not re.fullmatch(r"[1-9][0-9]{0,9}", PR):
+              print("n11=fail (no pull request number)")
+              sys.exit(1)
+          # Each write is invalid by construction (a zero SHA, a state that does not exist), so one that
+          # is wrongly permitted changes nothing. Statuses and check runs are the writes that could
+          # satisfy the required check.
+          WRITES = (("ref", "POST", f"/repos/{REPO}/git/refs",
+                     {"ref": "refs/heads/gdf/n11-never-created", "sha": ZERO}, "contents=write"),
+                    ("pull", "PATCH", f"/repos/{REPO}/pulls/{PR}", {"state": "gdf-n11-invalid"}, "pull_requests=write"),
+                    ("status", "POST", f"/repos/{REPO}/statuses/{ZERO}",
+                     {"state": "gdf-n11-invalid", "context": "gdf-n11"}, "statuses=write"),
+                    ("check", "POST", f"/repos/{REPO}/check-runs",
+                     {"name": "gdf-n11", "head_sha": ZERO, "status": "gdf-n11-invalid"}, "checks=write"))
+          control, writes, failure = None, [], None
+          try:
+              # The positive control: the same token, host and client must be accepted for a read.
+              control = call("GET", f"/repos/{REPO}")
+              for name, method, path, body, permission in WRITES:
+                  writes.append((name, call(method, path, body), permission))
+          except Exception as error:
+              failure = error
+          # Accepted or validated (422) means permitted: a definite failure, whatever else answered.
+          permitted = [name for name, (status, *_), _ in writes if 200 <= status < 300 or status == 422]
+          if permitted:
+              print(f"n11=fail permitted {permitted}")
+              sys.exit(1)
+          if failure is not None:
+              print(f"n11=fail (request error: {type(failure).__name__})")
+              sys.exit(1)
+          if control[2] or any(result[2] for _, result, _ in writes):
+              print("n11=inconclusive (rate-limited)")
+              sys.exit(1)
+          wrong = ["control"] if control[0] != 200 else []
+          wrong += [name for name, (status, message, _, accepted), permission in writes
+                    if status != 403 or message != REFUSED or not names(accepted, permission)]
+          print("n11=pass" if not wrong else f"n11=fail {wrong}")
+          sys.exit(1 if wrong else 0)
+          PY

@@ -1,0 +1,366 @@
+name: gdf-agent
+run-name: "gdf ${{ inputs.role }} ${{ inputs.nonce }}"
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: coding or quality
+        required: true
+        type: choice
+        options: [coding, quality]
+      nonce:
+        description: 32 lowercase hex characters, unique per dispatch
+        required: true
+        type: string
+      start_sha:
+        required: true
+        type: string
+      baseline_sha:
+        required: true
+        type: string
+      candidate_sha:
+        required: false
+        type: string
+        default: ""
+      diff_sha256:
+        required: false
+        type: string
+        default: ""
+      prompt:
+        required: true
+        type: string
+      cli_timeout:
+        required: true
+        type: string
+      max_turns:
+        required: false
+        type: string
+        default: ""
+      budget_usd:
+        required: false
+        type: string
+        default: ""
+permissions: {}
+env:
+  CLAUDE_VERSION: "2.1.316"
+  CLAUDE_SHA512: "sha512-RQDM6N285IjNKcmlPRriayNzpTkEJreAw5/vBU+V0R3qljkQ5z6/pSbzcVUAXvasoOlvub0RIma3NWvSuZA8Cg=="
+  CODEX_VERSION: "0.166.0"
+  CODEX_SHA512: "sha512-CxDm3+D1cpbGJeHrdzINoG+3wn9BVncP4qpZaaNYkxe8iPtRJOYyCJnnPoVjWRIBvI9vPKbRoifsMSA5xDaUpw=="
+  # Anthropic's published release-signing key (code.claude.com/docs/en/setup), and the digest GitHub
+  # computed for openai/codex's release asset codex-npm-linux-x64-0.166.0.tgz (tag rust-v0.166.0).
+  CLAUDE_KEY_FINGERPRINT: "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+  CODEX_RELEASE_SHA256: "cbc00a26d3d0e2ceefc4be8891f8a81ef1e349b3b175bc0ae308762bc001fd93"
+  DISABLE_UPDATES: "1"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  GIT_TERMINAL_PROMPT: "0"
+jobs:
+  coder:
+    if: inputs.role == 'coding'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    environment: gdf-coder
+    steps:
+      - name: Validate inputs
+        env:
+          NONCE: ${{ inputs.nonce }}
+          START: ${{ inputs.start_sha }}
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          DIGEST: ${{ inputs.diff_sha256 }}
+          CLI_TIMEOUT: ${{ inputs.cli_timeout }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          BUDGET: ${{ inputs.budget_usd }}
+        run: |
+          [[ "$NONCE" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::bad nonce"; exit 1; }
+          [[ "$START" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha"; exit 1; }
+          [[ -z "$CAND" && -z "$DIGEST" ]] || { echo "::error::coding binds no candidate"; exit 1; }
+          [[ "$CLI_TIMEOUT" =~ ^[1-9][0-9]{1,2}$ ]] && (( CLI_TIMEOUT <= 780 )) || { echo "::error::bad timeout"; exit 1; }
+          [[ "$MAX_TURNS" =~ ^[1-9][0-9]?$ ]] || { echo "::error::bad max_turns"; exit 1; }
+          [[ "$BUDGET" =~ ^(0|[1-9][0-9]{0,5})(\.[0-9]{1,4})?$ ]] || { echo "::error::bad budget"; exit 1; }
+      - name: Trusted helpers, from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: The start tree, from a pristine Git directory outside the workspace
+        env:
+          START: ${{ inputs.start_sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          set -euo pipefail
+          g="$RUNNER_TEMP/pristine.git"; w="$RUNNER_TEMP/workspace"
+          git() { command git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.file.allow=never --git-dir="$g" "$@"; }
+          command git init -q --bare "$g"
+          git fetch -q --no-tags "$REPO_URL" "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/gdf/*:refs/remotes/origin/gdf/*"
+          reachable=no
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/origin); do
+            if git merge-base --is-ancestor "$START" "$ref" 2>/dev/null; then reachable=yes; break; fi
+          done
+          [ "$reachable" = yes ] || { echo "::error::start sha not reachable from main or gdf/*"; exit 1; }
+          mkdir -m 700 "$w"
+          git --work-tree="$w" checkout -q "$START" -- .
+          test ! -e "$w/.git"
+          python3 -I trusted/ci/pack.py manifest "$w" "$RUNNER_TEMP/start-manifest.json"
+          echo "GDF_WORKSPACE=$w" >> "$GITHUB_ENV"
+      - name: Install the pinned CLIs
+        run: bash trusted/ci/install-clis.sh
+      - name: Verify the CLIs against their publishers' sources
+        run: bash trusted/ci/verify-clis.sh
+      - name: Seal the trusted helpers out of the agent's reach, before the drop
+        run: |
+          set -euo pipefail
+          sudo install -d -o root -g root -m 755 /opt/gdf
+          sudo cp -R trusted/ci /opt/gdf/ci
+          sudo cp "$RUNNER_TEMP/start-manifest.json" /opt/gdf/start-manifest.json
+          sudo chown -R root:root /opt/gdf
+          sudo chmod -R a-w,a+rX /opt/gdf
+      - name: Drop sudo
+        run: bash trusted/ci/drop-sudo.sh
+      - name: Verify the drop, in a new step process
+        run: |
+          if sudo -n true 2> /dev/null; then echo "::error::sudo still works"; exit 1; fi
+          if sudo -n -l > /dev/null 2>&1; then echo "::error::sudo -l still lists commands"; exit 1; fi
+          [ "$(stat -c '%u %A' /usr/bin/sudo)" = "0 -rwsr-xr-x" ] || { echo "::error::sudo is not setuid root"; exit 1; }
+          if docker info > /dev/null 2>&1; then echo "::error::docker still usable"; exit 1; fi
+          while IFS= read -r sock; do
+            if [ -w "$sock" ]; then echo "::error::socket still writable: $sock"; exit 1; fi
+          done < "$RUNNER_TEMP/r13-sockets.txt"
+          echo "r13_routes=$(find / -xdev -perm -4000 -type f 2>/dev/null | head -n 40 | tr '\n' ' ')"
+      - name: Claude Code
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROMPT: ${{ inputs.prompt }}
+          CLI_TIMEOUT: ${{ inputs.cli_timeout }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          BUDGET: ${{ inputs.budget_usd }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/out"; h="$RUNNER_TEMP/claude-home"
+          mkdir -m 700 "$out" "$h"
+          start=$(date +%s)
+          cd "$GDF_WORKSPACE"
+          set +e
+          printf '%s' "$PROMPT" | env -i HOME="$h" CLAUDE_CONFIG_DIR="$h/.claude" CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
+            PATH=/usr/bin:/bin LANG=C.UTF-8 NO_COLOR=1 DISABLE_UPDATES=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+            ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+            timeout --kill-after=10 "$CLI_TIMEOUT" "$CLAUDE_BIN" -p --bare --restricted --permission-prompts none \
+            --no-session-persistence --output-format stream-json --verbose --max-turns "$MAX_TURNS" \
+            --permission-mode dontAsk --strict-mcp-config --tools Read,Glob,Grep,Edit,Write --max-budget-usd "$BUDGET" \
+            > "$out/stdout.jsonl" 2> "$out/stderr.txt"
+          code=$?
+          set -e
+          for f in "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY"; do
+            if [ -s "$f" ]; then echo "::error::the agent wrote a file command"; exit 1; fi
+          done
+          timed_out=false; [ "$code" = 124 ] || [ "$code" = 137 ] && timed_out=true
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "timed_out=$timed_out" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+      - name: Pack the changeset, with no Git in the workspace
+        env:
+          NONCE: ${{ inputs.nonce }}
+          EXIT_CODE: ${{ steps.agent.outputs.exit_code }}
+          TIMED_OUT: ${{ steps.agent.outputs.timed_out }}
+          SECONDS_TAKEN: ${{ steps.agent.outputs.seconds }}
+        run: |
+          python3 -I /opt/gdf/ci/pack.py coding "$GDF_WORKSPACE" /opt/gdf/start-manifest.json "$RUNNER_TEMP/out" \
+            "$NONCE" "$EXIT_CODE" "$TIMED_OUT" "$SECONDS_TAKEN"
+      - name: Canary backstop before upload
+        env:
+          CANARY: ${{ secrets.GDF_CANARY }}
+        run: |
+          if grep -rqF -- "$CANARY" "$RUNNER_TEMP/out"; then echo "::error::the canary is in the output"; exit 1; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gdf-coding-${{ inputs.nonce }}
+          path: ${{ runner.temp }}/out/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  record:
+    if: inputs.role == 'quality'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Validate inputs
+        env:
+          NONCE: ${{ inputs.nonce }}
+          START: ${{ inputs.start_sha }}
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          DIGEST: ${{ inputs.diff_sha256 }}
+        run: |
+          [[ "$NONCE" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::bad nonce"; exit 1; }
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$CAND" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha"; exit 1; }
+          [ "$START" = "$CAND" ] || { echo "::error::a review starts from its candidate"; exit 1; }
+          [[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad digest"; exit 1; }
+      - name: Trusted helpers, from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: The full diff, as the orchestrator makes it
+        env:
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          set -euo pipefail
+          g="$RUNNER_TEMP/pristine.git"; out="$RUNNER_TEMP/record"
+          git() { command git -c core.fsmonitor=false -c core.hooksPath=/dev/null --git-dir="$g" "$@"; }
+          command git init -q --bare "$g"
+          git fetch -q --no-tags "$REPO_URL" "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/gdf/*:refs/remotes/origin/gdf/*"
+          git merge-base --is-ancestor "$BASE" refs/remotes/origin/main
+          on_gdf=no
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/origin/gdf); do
+            if git merge-base --is-ancestor "$CAND" "$ref"; then on_gdf=yes; break; fi
+          done
+          [ "$on_gdf" = yes ] || { echo "::error::candidate not on gdf/*"; exit 1; }
+          mkdir -m 700 "$out"
+          git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --binary --full-index "$BASE" "$CAND" \
+            > "$out/candidate.diff"
+      - name: Compare with the expected digest
+        env:
+          DIGEST: ${{ inputs.diff_sha256 }}
+        run: |
+          got="$(sha256sum "$RUNNER_TEMP/record/candidate.diff" | cut -d' ' -f1)"
+          [ "$got" = "$DIGEST" ] || { echo "::error::the diff is not the one the orchestrator bound"; exit 1; }
+      - name: Record
+        env:
+          NONCE: ${{ inputs.nonce }}
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          DIGEST: ${{ inputs.diff_sha256 }}
+        run: python3 -I trusted/ci/pack.py record "$RUNNER_TEMP/record" "$NONCE" "$BASE" "$CAND" "$DIGEST"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gdf-record-${{ inputs.nonce }}
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
+          if-no-files-found: error
+
+  reviewer:
+    needs: record
+    if: inputs.role == 'quality'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    environment: gdf-reviewer
+    steps:
+      - name: Validate inputs
+        env:
+          NONCE: ${{ inputs.nonce }}
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          DIGEST: ${{ inputs.diff_sha256 }}
+          CLI_TIMEOUT: ${{ inputs.cli_timeout }}
+        run: |
+          [[ "$NONCE" =~ ^[0-9a-f]{32}$ && "$CAND" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad input"; exit 1; }
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad input"; exit 1; }
+          [[ "$CLI_TIMEOUT" =~ ^[1-9][0-9]{1,2}$ ]] && (( CLI_TIMEOUT <= 780 )) || { echo "::error::bad timeout"; exit 1; }
+      - name: Trusted helpers, from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: The candidate, and the same diff, checked against the bound digest
+        env:
+          BASE: ${{ inputs.baseline_sha }}
+          CAND: ${{ inputs.candidate_sha }}
+          DIGEST: ${{ inputs.diff_sha256 }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/workspace"
+          command git -c core.hooksPath=/dev/null clone -q --no-checkout "$REPO_URL" "$w"
+          git() { command git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$w" "$@"; }
+          git fetch -q --no-tags origin "+refs/heads/gdf/*:refs/remotes/origin/gdf/*"
+          git checkout -q --detach "$CAND"
+          mkdir "$w/.gdf-review"
+          git diff --no-ext-diff --no-textconv --no-renames --ignore-submodules=none --binary --full-index "$BASE" "$CAND" \
+            > "$w/.gdf-review/candidate.diff"
+          [ "$(sha256sum "$w/.gdf-review/candidate.diff" | cut -d' ' -f1)" = "$DIGEST" ]
+          echo "GDF_WORKSPACE=$w" >> "$GITHUB_ENV"
+      - name: Install the pinned CLIs
+        run: bash trusted/ci/install-clis.sh
+      - name: Verify the CLIs against their publishers' sources
+        run: bash trusted/ci/verify-clis.sh
+      - name: Allow the sandbox's user namespaces (S1a R9a), before the drop
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Seal the trusted helpers out of the agent's reach, before the drop
+        run: |
+          set -euo pipefail
+          sudo install -d -o root -g root -m 755 /opt/gdf
+          sudo cp -R trusted/ci /opt/gdf/ci
+          sudo chown -R root:root /opt/gdf
+          sudo chmod -R a-w,a+rX /opt/gdf
+      - name: Drop sudo
+        run: bash trusted/ci/drop-sudo.sh
+      - name: Verify the drop, in a new step process
+        run: |
+          if sudo -n true 2> /dev/null; then echo "::error::sudo still works"; exit 1; fi
+          if sudo -n -l > /dev/null 2>&1; then echo "::error::sudo -l still lists commands"; exit 1; fi
+          [ "$(stat -c '%u %A' /usr/bin/sudo)" = "0 -rwsr-xr-x" ] || { echo "::error::sudo is not setuid root"; exit 1; }
+          if docker info > /dev/null 2>&1; then echo "::error::docker still usable"; exit 1; fi
+          while IFS= read -r sock; do
+            if [ -w "$sock" ]; then echo "::error::socket still writable: $sock"; exit 1; fi
+          done < "$RUNNER_TEMP/r13-sockets.txt"
+      - name: Codex
+        id: agent
+        env:
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROMPT: ${{ inputs.prompt }}
+          CLI_TIMEOUT: ${{ inputs.cli_timeout }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/out"; h="$RUNNER_TEMP/codex-home"
+          mkdir -m 700 "$out" "$h"
+          start=$(date +%s)
+          set +e
+          printf '%s' "$PROMPT" | env -i HOME="$h" CODEX_HOME="$h" PATH=/usr/bin:/bin LANG=C.UTF-8 NO_COLOR=1 \
+            CODEX_API_KEY="$CODEX_API_KEY" \
+            timeout --kill-after=10 "$CLI_TIMEOUT" "$CODEX_BIN" exec --json --ephemeral --ignore-user-config --ignore-rules \
+            -s read-only -c 'approval_policy="never"' -c 'shell_environment_policy.inherit="none"' \
+            -c shell_environment_policy.ignore_default_excludes=false -c 'shell_environment_policy.set.PATH="/usr/bin:/bin"' \
+            -C "$GDF_WORKSPACE" \
+            --output-schema /opt/gdf/ci/review-schema.json - \
+            > "$out/stdout.jsonl" 2> "$out/stderr.txt"
+          code=$?
+          set -e
+          for f in "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY"; do
+            if [ -s "$f" ]; then echo "::error::the agent wrote a file command"; exit 1; fi
+          done
+          timed_out=false; [ "$code" = 124 ] || [ "$code" = 137 ] && timed_out=true
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "timed_out=$timed_out" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+      - name: Result, with no Git in the workspace
+        env:
+          NONCE: ${{ inputs.nonce }}
+          EXIT_CODE: ${{ steps.agent.outputs.exit_code }}
+          TIMED_OUT: ${{ steps.agent.outputs.timed_out }}
+          SECONDS_TAKEN: ${{ steps.agent.outputs.seconds }}
+        run: python3 -I /opt/gdf/ci/pack.py result "$RUNNER_TEMP/out" quality "$NONCE" "$EXIT_CODE" "$TIMED_OUT" "$SECONDS_TAKEN"
+      - name: Canary backstop before upload
+        env:
+          CANARY: ${{ secrets.GDF_CANARY }}
+        run: |
+          if grep -rqF -- "$CANARY" "$RUNNER_TEMP/out"; then echo "::error::the canary is in the output"; exit 1; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gdf-review-${{ inputs.nonce }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
